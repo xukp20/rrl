@@ -33,7 +33,9 @@ class DBEncoder:
         self.f_df = f_df
         self.discrete = discrete
         self.y_one_hot = y_one_hot
-        self.label_enc = preprocessing.OneHotEncoder(categories='auto') if y_one_hot else preprocessing.LabelEncoder()
+        # For classification (y_one_hot=True): use OneHotEncoder
+        # For regression (y_one_hot=False): no encoding needed (keep continuous values)
+        self.label_enc = preprocessing.OneHotEncoder(categories='auto') if y_one_hot else None
         self.feature_enc = preprocessing.OneHotEncoder(categories='auto', drop=drop)
         self.imp = SimpleImputer(missing_values=np.nan, strategy='mean')
         self.X_fname = None
@@ -48,15 +50,22 @@ class DBEncoder:
         continuous_data = X_df[self.f_df.loc[self.f_df[1] == 'continuous', 0]]
         if not continuous_data.empty:
             continuous_data = continuous_data.replace(to_replace=r'.*\?.*', value=np.nan, regex=True)
-            continuous_data = continuous_data.astype(np.float)
+            continuous_data = continuous_data.astype(np.float64)  # Fixed: np.float → np.float64
         return discrete_data, continuous_data
 
     def fit(self, X_df, y_df):
         X_df = X_df.reset_index(drop=True)
         y_df = y_df.reset_index(drop=True)
         discrete_data, continuous_data = self.split_data(X_df)
-        self.label_enc.fit(y_df)
-        self.y_fname = list(self.label_enc.get_feature_names(y_df.columns)) if self.y_one_hot else y_df.columns
+
+        # For classification: fit OneHotEncoder
+        # For regression: no encoding needed
+        if self.y_one_hot:
+            self.label_enc.fit(y_df)
+            self.y_fname = list(self.label_enc.get_feature_names_out(y_df.columns))
+        else:
+            # For regression, y_fname is just the original column name
+            self.y_fname = y_df.columns
 
         if not continuous_data.empty:
             # Use mean as missing value for continuous columns if do not discretize them.
@@ -65,7 +74,7 @@ class DBEncoder:
             # One-hot encoding
             self.feature_enc.fit(discrete_data)
             feature_names = discrete_data.columns
-            self.X_fname = list(self.feature_enc.get_feature_names(feature_names))
+            self.X_fname = list(self.feature_enc.get_feature_names_out(feature_names))
             self.discrete_flen = len(self.X_fname)
             if not self.discrete:
                 self.X_fname.extend(continuous_data.columns)
@@ -78,10 +87,15 @@ class DBEncoder:
         X_df = X_df.reset_index(drop=True)
         y_df = y_df.reset_index(drop=True)
         discrete_data, continuous_data = self.split_data(X_df)
-        # Encode string value to int index.
-        y = self.label_enc.transform(y_df.values.reshape(-1, 1))
+
+        # Handle target variable transformation
         if self.y_one_hot:
+            # Classification: one-hot encode categorical labels
+            y = self.label_enc.transform(y_df.values.reshape(-1, 1))
             y = y.toarray()
+        else:
+            # Regression: keep original continuous values
+            y = y_df.values.astype(np.float64).reshape(-1)
 
         if not continuous_data.empty:
             # Use mean as missing value for continuous columns if we do not discretize them.

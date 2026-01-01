@@ -1,5 +1,6 @@
 import os
 import logging
+import warnings
 import numpy as np
 import torch
 torch.set_num_threads(2)
@@ -11,18 +12,25 @@ import torch.distributed as dist
 from sklearn.model_selection import KFold, train_test_split
 from collections import defaultdict
 
+# Suppress sklearn warnings
+warnings.filterwarnings('ignore', message='X does not have valid feature names')
+warnings.filterwarnings('ignore', message='Precision is ill-defined')
+
 from rrl.utils import read_csv, DBEncoder
 from rrl.models import RRL
 
 DATA_DIR = './dataset'
 
 
-def get_data_loader(dataset, world_size, rank, batch_size, k=0, pin_memory=False, save_best=True):
+def get_data_loader(dataset, world_size, rank, batch_size, k=0, pin_memory=False, save_best=True, task='classification'):
     data_path = os.path.join(DATA_DIR, dataset + '.data')
     info_path = os.path.join(DATA_DIR, dataset + '.info')
     X_df, y_df, f_df, label_pos = read_csv(data_path, info_path, shuffle=True)
 
-    db_enc = DBEncoder(f_df, discrete=False)
+    # For classification: y_one_hot=True (One-Hot encode labels)
+    # For regression: y_one_hot=False (keep continuous values)
+    is_classification = (task == 'classification')
+    db_enc = DBEncoder(f_df, discrete=False, y_one_hot=is_classification)
     db_enc.fit(X_df, y_df)
 
     X, y = db_enc.transform(X_df, y_df, normalized=True, keep_stat=True)
@@ -68,14 +76,17 @@ def train_model(gpu, args):
 
     dataset = args.data_set
     db_enc, train_loader, valid_loader, _ = get_data_loader(dataset, args.world_size, rank, args.batch_size,
-                                                            k=args.ith_kfold, pin_memory=True, save_best=args.save_best)
+                                                            k=args.ith_kfold, pin_memory=True, save_best=args.save_best, task=args.task)
 
     X_fname = db_enc.X_fname
     y_fname = db_enc.y_fname
     discrete_flen = db_enc.discrete_flen
     continuous_flen = db_enc.continuous_flen
 
-    rrl = RRL(dim_list=[(discrete_flen, continuous_flen)] + list(map(int, args.structure.split('@'))) + [len(y_fname)],
+    # Output dimension: for classification = number of classes, for regression = 1
+    output_dim = 1 if args.task == 'regression' else len(y_fname)
+
+    rrl = RRL(dim_list=[(discrete_flen, continuous_flen)] + list(map(int, args.structure.split('@'))) + [output_dim],
               device_id=device_id,
               use_not=args.use_not,
               is_rank0=is_rank0,
@@ -89,7 +100,9 @@ def train_model(gpu, args):
               alpha=args.alpha,
               beta=args.beta,
               gamma=args.gamma,
-              temperature=args.temp)
+              temperature=args.temp,
+              task=args.task,
+              use_log_target=args.use_log_target)
 
     rrl.train_model(
         data_loader=train_loader,
@@ -100,6 +113,9 @@ def train_model(gpu, args):
         lr_decay_epoch=args.lr_decay_epoch,
         weight_decay=args.weight_decay,
         log_iter=args.log_iter)
+
+    # Clean up distributed process group
+    dist.destroy_process_group()
 
 
 def load_model(path, device_id, log_file=None, distributed=True):
@@ -117,7 +133,9 @@ def load_model(path, device_id, log_file=None, distributed=True):
         use_nlaf=saved_args['use_nlaf'],
         alpha=saved_args['alpha'],
         beta=saved_args['beta'],
-        gamma=saved_args['gamma'])
+        gamma=saved_args['gamma'],
+        task=saved_args.get('task', 'classification'),  # Default to classification for backward compatibility
+        use_log_target=saved_args.get('use_log_target', False))  # Default to False for backward compatibility
     stat_dict = checkpoint['model_state_dict']
     for key in list(stat_dict.keys()):
         # remove 'module.' prefix
@@ -129,7 +147,7 @@ def load_model(path, device_id, log_file=None, distributed=True):
 def test_model(args):
     rrl = load_model(args.model, args.device_ids[0], log_file=args.test_res, distributed=False)
     dataset = args.data_set
-    db_enc, train_loader, _, test_loader = get_data_loader(dataset, 4, 0, args.batch_size, args.ith_kfold, save_best=False)
+    db_enc, train_loader, _, test_loader = get_data_loader(dataset, 4, 0, args.batch_size, args.ith_kfold, save_best=False, task=args.task)
     rrl.test(test_loader=test_loader, set_name='Test')
     if args.print_rule:
         with open(args.rrl_file, 'w') as rrl_file:

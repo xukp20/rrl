@@ -44,12 +44,16 @@ parser.add_argument('--print_rule', action="store_true",
 parser.add_argument('-s', '--structure', type=str, default='5@64',
                     help='Set the number of nodes in the binarization layer and logical layers. '
                          'E.g., 10@64, 10@64@32@16.')
+parser.add_argument('--task', type=str, default='classification', choices=['classification', 'regression'],
+                    help='Set the task type: classification or regression.')
+parser.add_argument('--use_log_target', action="store_true",
+                    help='Use log-transformed target for regression. Predictions will be exp-transformed before evaluation.')
 
 rrl_args = parser.parse_args()
-rrl_args.folder_name = '{}_e{}_bs{}_lr{}_lrdr{}_lrde{}_wd{}_ki{}_rc{}_useNOT{}_saveBest{}_useNLAF{}_estimatedGrad{}_useSkip{}_alpha{}_beta{}_gamma{}_temp{}'.format(
+rrl_args.folder_name = '{}_e{}_bs{}_lr{}_lrdr{}_lrde{}_wd{}_ki{}_rc{}_useNOT{}_saveBest{}_useNLAF{}_estimatedGrad{}_useSkip{}_alpha{}_beta{}_gamma{}_temp{}_task{}'.format(
     rrl_args.data_set, rrl_args.epoch, rrl_args.batch_size, rrl_args.learning_rate, rrl_args.lr_decay_rate,
     rrl_args.lr_decay_epoch, rrl_args.weight_decay, rrl_args.ith_kfold, rrl_args.round_count, rrl_args.use_not,
-    rrl_args.save_best, rrl_args.nlaf, rrl_args.estimated_grad, rrl_args.skip, rrl_args.alpha, rrl_args.beta, rrl_args.gamma, rrl_args.temp)
+    rrl_args.save_best, rrl_args.nlaf, rrl_args.estimated_grad, rrl_args.skip, rrl_args.alpha, rrl_args.beta, rrl_args.gamma, rrl_args.temp, rrl_args.task)
 
 if not os.path.exists('log_folder'):
     os.mkdir('log_folder')
