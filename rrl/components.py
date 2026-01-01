@@ -35,7 +35,7 @@ class Binarize(torch.autograd.Function):
 class BinarizeLayer(nn.Module):
     """Implement the feature discretization and binarization."""
 
-    def __init__(self, n, input_dim, use_not=False, left=None, right=None):
+    def __init__(self, n, input_dim, use_not=False, left=None, right=None, init_cl=None):
         super(BinarizeLayer, self).__init__()
         self.n = n
         self.input_dim = input_dim
@@ -52,10 +52,24 @@ class BinarizeLayer(nn.Module):
         self.register_buffer('right', right)
 
         if self.input_dim[1] > 0:
-            if self.left is not None and self.right is not None:
+            # Support quantile-based initialization
+            if init_cl is not None:
+                # If quantiles are provided, use them directly
+                # init_cl shape should be (n, input_dim[1])
+                if isinstance(init_cl, torch.Tensor):
+                    cl = init_cl.clone()
+                else:
+                    cl = torch.tensor(init_cl, dtype=torch.float32)
+
+                # Ensure shape matches
+                assert cl.shape == (self.n, self.input_dim[1]), \
+                    f"Quantile shape mismatch: expected {(self.n, self.input_dim[1])}, got {cl.shape}"
+
+            elif self.left is not None and self.right is not None:
                 cl = self.left + torch.rand(self.n, self.input_dim[1]) * (self.right - self.left)
             else:
                 cl = torch.randn(self.n, self.input_dim[1])
+
             self.register_buffer('cl', cl)
 
     def forward(self, x):
@@ -421,10 +435,235 @@ def extract_rules(prev_layer, skip_connect_layer, layer, pos_shift=0):
     return dim2id, rule_list
 
 
-class UnionLayer(nn.Module):
-    """The union layer is used to learn the rule-based representation."""
+################################################################################
+# New Improved Logic Layers (Linear Approximation & LogSumExp)
+################################################################################
 
-    def __init__(self, n, input_dim, use_not=False, use_nlaf=False, estimated_grad=False, alpha=0.999, beta=8, gamma=1):
+class LinearConjunctionLayer(nn.Module):
+    """
+    Linear Approximation for AND Logic.
+    Replaces the complex NLAF with a simple Dot Product + Sigmoid.
+    This is a new implementation that accepts temperature parameter.
+    """
+    def __init__(self, n, input_dim, use_not=False, alpha=None, beta=None, gamma=None):
+        super(LinearConjunctionLayer, self).__init__()
+        self.n = n
+        self.use_not = use_not
+        self.input_dim = input_dim if not use_not else input_dim * 2
+        self.output_dim = self.n
+        self.layer_type = 'conjunction'
+
+        # W shape: (Input, Output)
+        self.W = nn.Parameter(INIT_L + (0.5 - INIT_L) * torch.rand(self.input_dim, self.n))
+        self.node_activation_cnt = None
+
+    def forward(self, x, temperature=1.0):
+        # Accept temperature parameter
+        res_tilde = self.continuous_forward(x, temperature)
+        res_bar = self.binarized_forward(x)
+        return GradGraft.apply(res_bar, res_tilde)
+
+    def continuous_forward(self, x, temperature):
+        if self.use_not:
+            x = torch.cat((x, 1 - x), dim=1)
+        # Clamp temperature to avoid numerical issues
+        temperature = torch.clamp(temperature, min=1e-8, max=100.0)
+        overlap = x @ self.W
+        required_match = torch.sum(self.W, dim=0)
+        bias = 0.5
+        return torch.sigmoid(temperature * (overlap - required_match + bias))
+
+    @torch.no_grad()
+    def binarized_forward(self, x):
+        if self.use_not:
+            x = torch.cat((x, 1 - x), dim=1)
+        Wb = Binarize.apply(self.W - THRESHOLD)
+        # Discrete logic: (1-x) @ Wb computes the sum of "mismatch" weights
+        # If res > 0, there's an unmatched required item -> output 0
+        res = (1 - x) @ Wb
+        return torch.where(res > 0, torch.zeros_like(res), torch.ones_like(res))
+
+    def clip(self):
+        self.W.data.clamp_(INIT_L, 1.0)
+
+
+class LinearDisjunctionLayer(nn.Module):
+    """
+    Linear Approximation for OR Logic.
+    """
+    def __init__(self, n, input_dim, use_not=False, alpha=None, beta=None, gamma=None):
+        super(LinearDisjunctionLayer, self).__init__()
+        self.n = n
+        self.use_not = use_not
+        self.input_dim = input_dim if not use_not else input_dim * 2
+        self.output_dim = self.n
+        self.layer_type = 'disjunction'
+
+        self.W = nn.Parameter(INIT_L + (0.5 - INIT_L) * torch.rand(self.input_dim, self.n))
+        self.node_activation_cnt = None
+
+    def forward(self, x, temperature=1.0):
+        res_tilde = self.continuous_forward(x, temperature)
+        res_bar = self.binarized_forward(x)
+        return GradGraft.apply(res_bar, res_tilde)
+
+    def continuous_forward(self, x, temperature):
+        if self.use_not:
+            x = torch.cat((x, 1 - x), dim=1)
+        # Clamp temperature to avoid numerical issues
+        temperature = torch.clamp(temperature, min=1e-8, max=100.0)
+        match_score = x @ self.W
+        bias = 0.5
+        return torch.sigmoid(temperature * (match_score - bias))
+
+    @torch.no_grad()
+    def binarized_forward(self, x):
+        if self.use_not:
+            x = torch.cat((x, 1 - x), dim=1)
+        Wb = Binarize.apply(self.W - THRESHOLD)
+        res = x @ Wb
+        return torch.where(res > 0, torch.ones_like(res), torch.zeros_like(res))
+
+    def clip(self):
+        self.W.data.clamp_(INIT_L, 1.0)
+
+
+class LogSumExpConjunctionLayer(nn.Module):
+    """
+    LogSumExp Implementation for AND Logic (SoftMin).
+    Provides mathematically precise smooth approximation to minimum.
+    This is a new implementation that accepts temperature parameter.
+    """
+    def __init__(self, n, input_dim, use_not=False, estimated_grad=False):
+        super(LogSumExpConjunctionLayer, self).__init__()
+        self.n = n
+        self.use_not = use_not
+        self.input_dim = input_dim if not use_not else input_dim * 2
+        self.output_dim = self.n
+        self.layer_type = 'conjunction'
+
+        self.W = nn.Parameter(INIT_RANGE * torch.rand(self.input_dim, self.n))
+        self.node_activation_cnt = None
+
+    def forward(self, x, temperature=1.0):
+        res_tilde = self.continuous_forward(x, temperature)
+        res_bar = self.binarized_forward(x)
+        return GradGraft.apply(res_bar, res_tilde)
+
+    def continuous_forward(self, x, temperature):
+        # AND Logic via SoftMin:
+        # Conj = -1/T * log( sum( exp( -T * (1 - h*W) ) ) )
+        # Note: Broadcasting may consume significant memory
+        # For memory-constrained scenarios, consider using LinearConjunctionLayer
+
+        # Clamp temperature to avoid numerical issues
+        temperature = torch.clamp(temperature, min=1e-8, max=100.0)
+
+        if self.use_not:
+            x = torch.cat((x, 1 - x), dim=1)
+        # x: (B, In), W: (In, Out)
+        # Target: (B, Out)
+
+        # Expand dimensions for broadcasting:
+        # x: (B, 1, In)
+        # W: (1, Out, In)
+        x_exp = x.unsqueeze(1)
+        W_exp = self.W.t().unsqueeze(0)  # (1, Out, In)
+
+        # (B, Out, In) - Warning: Large Memory Consumption!
+        # If OOM occurs, use LinearConjunctionLayer instead
+        terms = 1.0 - W_exp * (1.0 - x_exp)
+
+        # SoftMin = -1/T * LogSumExp(-T * terms)
+        out = -(1.0 / temperature) * torch.logsumexp(-temperature * terms, dim=2)
+        return out
+
+    @torch.no_grad()
+    def binarized_forward(self, x):
+        if self.use_not:
+            x = torch.cat((x, 1 - x), dim=1)
+        Wb = Binarize.apply(self.W - THRESHOLD)
+        # For numerical stability, use sum check for discrete logic
+        # mismatch if W=1 and x=0
+        mismatches = (1-x) @ Wb
+        return torch.where(mismatches > 0, torch.zeros_like(mismatches), torch.ones_like(mismatches))
+
+    def clip(self):
+        self.W.data.clamp_(0.0, 1.0)
+
+
+class LogSumExpDisjunctionLayer(nn.Module):
+    """
+    LogSumExp Implementation for OR Logic (SoftMax).
+    Provides mathematically precise smooth approximation to maximum.
+    """
+    def __init__(self, n, input_dim, use_not=False, estimated_grad=False):
+        super(LogSumExpDisjunctionLayer, self).__init__()
+        self.n = n
+        self.use_not = use_not
+        self.input_dim = input_dim if not use_not else input_dim * 2
+        self.output_dim = self.n
+        self.layer_type = 'disjunction'
+
+        self.W = nn.Parameter(INIT_RANGE * torch.rand(self.input_dim, self.n))
+        self.node_activation_cnt = None
+
+    def forward(self, x, temperature=1.0):
+        res_tilde = self.continuous_forward(x, temperature)
+        res_bar = self.binarized_forward(x)
+        return GradGraft.apply(res_bar, res_tilde)
+
+    def continuous_forward(self, x, temperature):
+        # OR Logic via SoftMax:
+        # Disj = 1/T * log( sum( exp( T * h*W ) ) )
+
+        # Clamp temperature to avoid numerical issues
+        temperature = torch.clamp(temperature, min=1e-8, max=100.0)
+
+        if self.use_not:
+            x = torch.cat((x, 1 - x), dim=1)
+
+        # Expand dimensions for broadcasting
+        x_exp = x.unsqueeze(1)  # (B, 1, In)
+        W_exp = self.W.t().unsqueeze(0)  # (1, Out, In)
+
+        # (B, Out, In) - Warning: Large Memory Consumption!
+        terms = x_exp * W_exp
+
+        # SoftMax = 1/T * LogSumExp(T * terms)
+        out = (1.0 / temperature) * torch.logsumexp(temperature * terms, dim=2)
+        return out
+
+    @torch.no_grad()
+    def binarized_forward(self, x):
+        if self.use_not:
+            x = torch.cat((x, 1 - x), dim=1)
+        Wb = Binarize.apply(self.W - THRESHOLD)
+        # At least one match
+        matches = x @ Wb
+        return torch.where(matches > 0, torch.ones_like(matches), torch.zeros_like(matches))
+
+    def clip(self):
+        self.W.data.clamp_(0.0, 1.0)
+
+
+################################################################################
+# UnionLayer - Unified Interface for All Logic Implementations
+################################################################################
+
+class UnionLayer(nn.Module):
+    """
+    The union layer is used to learn the rule-based representation.
+
+    Supports multiple logic implementations:
+    - Original Product t-norm (default, when all flags are False)
+    - NLAF (when use_nlaf=True)
+    - Linear Approximation (when use_linear=True, requires temperature)
+    - LogSumExp (when use_logsumexp=True, requires temperature)
+    """
+
+    def __init__(self, n, input_dim, use_not=False, use_nlaf=False, estimated_grad=False,
+                 alpha=0.999, beta=8, gamma=1, use_linear=False, use_logsumexp=False):
         super(UnionLayer, self).__init__()
         self.n = n
         self.use_not = use_not
@@ -437,15 +676,43 @@ class UnionLayer(nn.Module):
         self.rule_list = None
         self.rule_name = None
 
-        if use_nlaf: # use novel logical activation functions
+        # Determine which implementation to use (priority: linear > logsumexp > nlaf > product)
+        if use_linear:
+            # Linear Approximation (requires temperature)
+            self.con_layer = LinearConjunctionLayer(self.n, self.input_dim, use_not=use_not, alpha=alpha, beta=beta, gamma=gamma)
+            self.dis_layer = LinearDisjunctionLayer(self.n, self.input_dim, use_not=use_not, alpha=alpha, beta=beta, gamma=gamma)
+            self.requires_temperature = True
+        elif use_logsumexp:
+            # LogSumExp (requires temperature)
+            self.con_layer = LogSumExpConjunctionLayer(self.n, self.input_dim, use_not=use_not, estimated_grad=estimated_grad)
+            self.dis_layer = LogSumExpDisjunctionLayer(self.n, self.input_dim, use_not=use_not, estimated_grad=estimated_grad)
+            self.requires_temperature = True
+        elif use_nlaf:
+            # Novel Logical Activation Functions (NLAF)
             self.con_layer = ConjunctionLayer(self.n, self.input_dim, use_not=use_not, alpha=alpha, beta=beta, gamma=gamma)
             self.dis_layer = DisjunctionLayer(self.n, self.input_dim, use_not=use_not, alpha=alpha, beta=beta, gamma=gamma)
-        else: # use original logical activation functions
+            self.requires_temperature = False
+        else:
+            # Original Product t-norm (default)
             self.con_layer = OriginalConjunctionLayer(self.n, self.input_dim, use_not=use_not, estimated_grad=estimated_grad)
             self.dis_layer = OriginalDisjunctionLayer(self.n, self.input_dim, use_not=use_not, estimated_grad=estimated_grad)
+            self.requires_temperature = False
 
-    def forward(self, x):
-        return torch.cat([self.con_layer(x), self.dis_layer(x)], dim=1)
+    def forward(self, x, temperature=None):
+        """
+        Forward pass with optional temperature parameter.
+
+        Args:
+            x: Input tensor
+            temperature: Temperature for logic approximation (only used by Linear and LogSumExp)
+        """
+        if self.requires_temperature and temperature is not None:
+            # New implementations that accept temperature
+            return torch.cat([self.con_layer(x, temperature=temperature),
+                            self.dis_layer(x, temperature=temperature)], dim=1)
+        else:
+            # Old implementations that don't accept temperature
+            return torch.cat([self.con_layer(x), self.dis_layer(x)], dim=1)
 
     def binarized_forward(self, x):
         return torch.cat([self.con_layer.binarized_forward(x),
@@ -502,3 +769,215 @@ class UnionLayer(nn.Module):
                     var_str = ('({})' if (wrap or not_str == '~') else '{}').format(input_rule_name[2 + layer_shift][ri[1]])
                     name += op_str + not_str + var_str
                 self.rule_name.append(name)
+
+
+################################################################################
+# New Improved Logic Layers (Linear Approximation & LogSumExp)
+################################################################################
+
+class LinearConjunctionLayer(nn.Module):
+    """
+    Linear Approximation for AND Logic.
+    Replaces the complex NLAF with a simple Dot Product + Sigmoid.
+    This is a new implementation that accepts temperature parameter.
+    """
+    def __init__(self, n, input_dim, use_not=False, alpha=None, beta=None, gamma=None):
+        super(LinearConjunctionLayer, self).__init__()
+        self.n = n
+        self.use_not = use_not
+        self.input_dim = input_dim if not use_not else input_dim * 2
+        self.output_dim = self.n
+        self.layer_type = 'conjunction'
+
+        # W shape: (Input, Output)
+        self.W = nn.Parameter(INIT_L + (0.5 - INIT_L) * torch.rand(self.input_dim, self.n))
+        self.node_activation_cnt = None
+
+    def forward(self, x, temperature=1.0):
+        # Accept temperature parameter
+        res_tilde = self.continuous_forward(x, temperature)
+        res_bar = self.binarized_forward(x)
+        return GradGraft.apply(res_bar, res_tilde)
+
+    def continuous_forward(self, x, temperature):
+        if self.use_not:
+            x = torch.cat((x, 1 - x), dim=1)
+        # Clamp temperature to avoid numerical issues
+        temperature = torch.clamp(temperature, min=1e-8, max=100.0)
+        overlap = x @ self.W
+        required_match = torch.sum(self.W, dim=0)
+        bias = 0.5
+        return torch.sigmoid(temperature * (overlap - required_match + bias))
+
+    @torch.no_grad()
+    def binarized_forward(self, x):
+        if self.use_not:
+            x = torch.cat((x, 1 - x), dim=1)
+        Wb = Binarize.apply(self.W - THRESHOLD)
+        # Discrete logic: (1-x) @ Wb computes the sum of "mismatch" weights
+        # If res > 0, there's an unmatched required item -> output 0
+        res = (1 - x) @ Wb
+        return torch.where(res > 0, torch.zeros_like(res), torch.ones_like(res))
+
+    def clip(self):
+        self.W.data.clamp_(INIT_L, 1.0)
+
+
+class LinearDisjunctionLayer(nn.Module):
+    """
+    Linear Approximation for OR Logic.
+    """
+    def __init__(self, n, input_dim, use_not=False, alpha=None, beta=None, gamma=None):
+        super(LinearDisjunctionLayer, self).__init__()
+        self.n = n
+        self.use_not = use_not
+        self.input_dim = input_dim if not use_not else input_dim * 2
+        self.output_dim = self.n
+        self.layer_type = 'disjunction'
+
+        self.W = nn.Parameter(INIT_L + (0.5 - INIT_L) * torch.rand(self.input_dim, self.n))
+        self.node_activation_cnt = None
+
+    def forward(self, x, temperature=1.0):
+        res_tilde = self.continuous_forward(x, temperature)
+        res_bar = self.binarized_forward(x)
+        return GradGraft.apply(res_bar, res_tilde)
+
+    def continuous_forward(self, x, temperature):
+        if self.use_not:
+            x = torch.cat((x, 1 - x), dim=1)
+        # Clamp temperature to avoid numerical issues
+        temperature = torch.clamp(temperature, min=1e-8, max=100.0)
+        match_score = x @ self.W
+        bias = 0.5
+        return torch.sigmoid(temperature * (match_score - bias))
+
+    @torch.no_grad()
+    def binarized_forward(self, x):
+        if self.use_not:
+            x = torch.cat((x, 1 - x), dim=1)
+        Wb = Binarize.apply(self.W - THRESHOLD)
+        res = x @ Wb
+        return torch.where(res > 0, torch.ones_like(res), torch.zeros_like(res))
+
+    def clip(self):
+        self.W.data.clamp_(INIT_L, 1.0)
+
+
+class LogSumExpConjunctionLayer(nn.Module):
+    """
+    LogSumExp Implementation for AND Logic (SoftMin).
+    Provides mathematically precise smooth approximation to minimum.
+    This is a new implementation that accepts temperature parameter.
+    """
+    def __init__(self, n, input_dim, use_not=False, estimated_grad=False):
+        super(LogSumExpConjunctionLayer, self).__init__()
+        self.n = n
+        self.use_not = use_not
+        self.input_dim = input_dim if not use_not else input_dim * 2
+        self.output_dim = self.n
+        self.layer_type = 'conjunction'
+
+        self.W = nn.Parameter(INIT_RANGE * torch.rand(self.input_dim, self.n))
+        self.node_activation_cnt = None
+
+    def forward(self, x, temperature=1.0):
+        res_tilde = self.continuous_forward(x, temperature)
+        res_bar = self.binarized_forward(x)
+        return GradGraft.apply(res_bar, res_tilde)
+
+    def continuous_forward(self, x, temperature):
+        # AND Logic via SoftMin:
+        # Conj = -1/T * log( sum( exp( -T * (1 - h*W) ) ) )
+        # Note: Broadcasting may consume significant memory
+        # For memory-constrained scenarios, consider using LinearConjunctionLayer
+
+        # Clamp temperature to avoid numerical issues
+        temperature = torch.clamp(temperature, min=1e-8, max=100.0)
+
+        if self.use_not:
+            x = torch.cat((x, 1 - x), dim=1)
+        # x: (B, In), W: (In, Out)
+        # Target: (B, Out)
+
+        # Expand dimensions for broadcasting:
+        # x: (B, 1, In)
+        # W: (1, Out, In)
+        x_exp = x.unsqueeze(1)
+        W_exp = self.W.t().unsqueeze(0)  # (1, Out, In)
+
+        # (B, Out, In) - Warning: Large Memory Consumption!
+        # If OOM occurs, use LinearConjunctionLayer instead
+        terms = 1.0 - W_exp * (1.0 - x_exp)
+
+        # SoftMin = -1/T * LogSumExp(-T * terms)
+        out = -(1.0 / temperature) * torch.logsumexp(-temperature * terms, dim=2)
+        return out
+
+    @torch.no_grad()
+    def binarized_forward(self, x):
+        if self.use_not:
+            x = torch.cat((x, 1 - x), dim=1)
+        Wb = Binarize.apply(self.W - THRESHOLD)
+        # For numerical stability, use sum check for discrete logic
+        # mismatch if W=1 and x=0
+        mismatches = (1-x) @ Wb
+        return torch.where(mismatches > 0, torch.zeros_like(mismatches), torch.ones_like(mismatches))
+
+    def clip(self):
+        self.W.data.clamp_(0.0, 1.0)
+
+
+class LogSumExpDisjunctionLayer(nn.Module):
+    """
+    LogSumExp Implementation for OR Logic (SoftMax).
+    Provides mathematically precise smooth approximation to maximum.
+    """
+    def __init__(self, n, input_dim, use_not=False, estimated_grad=False):
+        super(LogSumExpDisjunctionLayer, self).__init__()
+        self.n = n
+        self.use_not = use_not
+        self.input_dim = input_dim if not use_not else input_dim * 2
+        self.output_dim = self.n
+        self.layer_type = 'disjunction'
+
+        self.W = nn.Parameter(INIT_RANGE * torch.rand(self.input_dim, self.n))
+        self.node_activation_cnt = None
+
+    def forward(self, x, temperature=1.0):
+        res_tilde = self.continuous_forward(x, temperature)
+        res_bar = self.binarized_forward(x)
+        return GradGraft.apply(res_bar, res_tilde)
+
+    def continuous_forward(self, x, temperature):
+        # OR Logic via SoftMax:
+        # Disj = 1/T * log( sum( exp( T * h*W ) ) )
+
+        # Clamp temperature to avoid numerical issues
+        temperature = torch.clamp(temperature, min=1e-8, max=100.0)
+
+        if self.use_not:
+            x = torch.cat((x, 1 - x), dim=1)
+
+        # Expand dimensions for broadcasting
+        x_exp = x.unsqueeze(1)  # (B, 1, In)
+        W_exp = self.W.t().unsqueeze(0)  # (1, Out, In)
+
+        # (B, Out, In) - Warning: Large Memory Consumption!
+        terms = x_exp * W_exp
+
+        # SoftMax = 1/T * LogSumExp(T * terms)
+        out = (1.0 / temperature) * torch.logsumexp(temperature * terms, dim=2)
+        return out
+
+    @torch.no_grad()
+    def binarized_forward(self, x):
+        if self.use_not:
+            x = torch.cat((x, 1 - x), dim=1)
+        Wb = Binarize.apply(self.W - THRESHOLD)
+        # At least one match
+        matches = x @ Wb
+        return torch.where(matches > 0, torch.ones_like(matches), torch.zeros_like(matches))
+
+    def clip(self):
+        self.W.data.clamp_(0.0, 1.0)

@@ -28,6 +28,16 @@ parser.add_argument('--gamma', type=int, default=1, help='Set the gamma for NLAF
 
 parser.add_argument('--temp', type=float, default=1.0, help='Set the temperature.')
 
+# New logic layer implementations
+parser.add_argument('--use_linear', action="store_true",
+                    help='Use Linear Approximation (Dot Product + Sigmoid) for logic layers. Requires logic_temperature.')
+parser.add_argument('--use_logsumexp', action="store_true",
+                    help='Use LogSumExp (SoftMin/SoftMax) for logic layers. Requires logic_temperature.')
+parser.add_argument('--logic_temp', type=float, default=None,
+                    help='Set the temperature for logic layers (Linear/LogSumExp). If None, uses same as --temp.')
+parser.add_argument('--use_quantile_init', action="store_true",
+                    help='Use quantile-based initialization for binarization layer thresholds.')
+
 parser.add_argument('--use_not', action="store_true",
                     help='Use the NOT (~) operator in logical rules. '
                          'It will enhance model capability but make the RRL more complex.')
@@ -48,22 +58,43 @@ parser.add_argument('--task', type=str, default='classification', choices=['clas
                     help='Set the task type: classification or regression.')
 parser.add_argument('--use_log_target', action="store_true",
                     help='Use log-transformed target for regression. Predictions will be exp-transformed before evaluation.')
+parser.add_argument('--output_dir', type=str, default=None,
+                    help='Override output directory. If specified, all logs and models will be saved here instead of the auto-generated path.')
 
 rrl_args = parser.parse_args()
-rrl_args.folder_name = '{}_e{}_bs{}_lr{}_lrdr{}_lrde{}_wd{}_ki{}_rc{}_useNOT{}_saveBest{}_useNLAF{}_estimatedGrad{}_useSkip{}_alpha{}_beta{}_gamma{}_temp{}_task{}'.format(
+
+# Build folder name - keep original format and add suffixes for new features
+base_name = '{}_e{}_bs{}_lr{}_lrdr{}_lrde{}_wd{}_ki{}_rc{}_useNOT{}_saveBest{}_useNLAF{}_estimatedGrad{}_useSkip{}_alpha{}_beta{}_gamma{}_temp{}_task{}'.format(
     rrl_args.data_set, rrl_args.epoch, rrl_args.batch_size, rrl_args.learning_rate, rrl_args.lr_decay_rate,
     rrl_args.lr_decay_epoch, rrl_args.weight_decay, rrl_args.ith_kfold, rrl_args.round_count, rrl_args.use_not,
     rrl_args.save_best, rrl_args.nlaf, rrl_args.estimated_grad, rrl_args.skip, rrl_args.alpha, rrl_args.beta, rrl_args.gamma, rrl_args.temp, rrl_args.task)
 
-if not os.path.exists('log_folder'):
-    os.mkdir('log_folder')
-rrl_args.folder_name = rrl_args.folder_name + '_L' + rrl_args.structure
-rrl_args.set_folder_path = os.path.join('log_folder', rrl_args.data_set)
-if not os.path.exists(rrl_args.set_folder_path):
-    os.mkdir(rrl_args.set_folder_path)
-rrl_args.folder_path = os.path.join(rrl_args.set_folder_path, rrl_args.folder_name)
-if not os.path.exists(rrl_args.folder_path):
-    os.mkdir(rrl_args.folder_path)
+# Add suffixes for new features
+suffixes = []
+if rrl_args.use_linear:
+    suffixes.append('Linear')
+if rrl_args.use_logsumexp:
+    suffixes.append('LogSumExp')
+if rrl_args.use_quantile_init:
+    suffixes.append('Quantile')
+
+rrl_args.folder_name = base_name + ('_' + '_'.join(suffixes) if suffixes else '')
+
+# Use output_dir if specified, otherwise use auto-generated path
+if rrl_args.output_dir is not None:
+    rrl_args.folder_path = rrl_args.output_dir
+    if not os.path.exists(rrl_args.folder_path):
+        os.makedirs(rrl_args.folder_path, exist_ok=True)
+else:
+    if not os.path.exists('log_folder'):
+        os.mkdir('log_folder')
+    rrl_args.folder_name = rrl_args.folder_name + '_L' + rrl_args.structure
+    rrl_args.set_folder_path = os.path.join('log_folder', rrl_args.data_set)
+    if not os.path.exists(rrl_args.set_folder_path):
+        os.mkdir(rrl_args.set_folder_path)
+    rrl_args.folder_path = os.path.join(rrl_args.set_folder_path, rrl_args.folder_name)
+    if not os.path.exists(rrl_args.folder_path):
+        os.mkdir(rrl_args.folder_path)
 rrl_args.model = os.path.join(rrl_args.folder_path, 'model.pth')
 rrl_args.rrl_file = os.path.join(rrl_args.folder_path, 'rrl.txt')
 rrl_args.plot_file = os.path.join(rrl_args.folder_path, 'plot_file.pdf')

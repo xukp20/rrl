@@ -13,7 +13,7 @@ TEST_CNT_MOD = 500
 
 
 class Net(nn.Module):
-    def __init__(self, dim_list, use_not=False, left=None, right=None, use_nlaf=False, estimated_grad=False, use_skip=True, alpha=0.999, beta=8, gamma=1, temperature=None):
+    def __init__(self, dim_list, use_not=False, left=None, right=None, use_nlaf=False, estimated_grad=False, use_skip=True, alpha=0.999, beta=8, gamma=1, temperature=None, logic_temperature=None, init_cl=None, use_linear=False, use_logsumexp=False):
         super(Net, self).__init__()
 
         self.dim_list = dim_list
@@ -22,23 +22,36 @@ class Net(nn.Module):
         self.right = right
         self.layer_list = nn.ModuleList([])
         self.use_skip = use_skip
+
+        # Temperature for final softmax (classification tasks)
         # Only initialize temperature parameter for classification tasks
         if temperature is not None:
             self.t = nn.Parameter(torch.log(torch.tensor([temperature])))
         else:
             self.t = None
 
+        # Temperature for logic layers (Linear/LogSumExp implementations)
+        # If logic_temperature is provided, create independent parameter
+        # If None, bind to self.t (share the same parameter)
+        if logic_temperature is not None:
+            self.logic_t = nn.Parameter(torch.log(torch.tensor([logic_temperature])))
+            self.logic_temp_independent = True
+        else:
+            self.logic_t = self.t  # Bind to classification temperature
+            self.logic_temp_independent = False
+
         prev_layer_dim = dim_list[0]
         for i in range(1, len(dim_list)):
             num = prev_layer_dim
-            
+
             skip_from_layer = None
             if self.use_skip and i >= 4:
                 skip_from_layer = self.layer_list[-2]
                 num += skip_from_layer.output_dim
 
             if i == 1:
-                layer = BinarizeLayer(dim_list[i], num, self.use_not, self.left, self.right)
+                # Support quantile-based initialization
+                layer = BinarizeLayer(dim_list[i], num, self.use_not, self.left, self.right, init_cl=init_cl)
                 layer_name = 'binary{}'.format(i)
             elif i == len(dim_list) - 1:
                 layer = LRLayer(dim_list[i], num)
@@ -46,9 +59,9 @@ class Net(nn.Module):
             else:
                 # The first logical layer does not use NOT if the binarization layer has already used NOT
                 layer_use_not = True if i != 2 else False
-                layer = UnionLayer(dim_list[i], num, use_nlaf=use_nlaf, estimated_grad=estimated_grad, use_not=layer_use_not, alpha=alpha, beta=beta, gamma=gamma)
+                layer = UnionLayer(dim_list[i], num, use_nlaf=use_nlaf, estimated_grad=estimated_grad, use_not=layer_use_not, alpha=alpha, beta=beta, gamma=gamma, use_linear=use_linear, use_logsumexp=use_logsumexp)
                 layer_name = 'union{}'.format(i)
-            
+
             layer.conn = lambda: None  # create an empty class to save the connections
             layer.conn.prev_layer = self.layer_list[-1] if len(self.layer_list) > 0 else None
             layer.conn.is_skip_to_layer = False
@@ -61,11 +74,23 @@ class Net(nn.Module):
             self.layer_list.append(layer)
 
     def forward(self, x):
+        # Compute logic temperature for layers that need it
+        if self.logic_t is not None:
+            current_logic_temp = torch.exp(self.logic_t)
+        else:
+            current_logic_temp = None
+
         for layer in self.layer_list:
             if layer.conn.skip_from_layer is not None:
                 x = torch.cat((x, layer.conn.skip_from_layer.x_res), dim=1)
                 del layer.conn.skip_from_layer.x_res
-            x = layer(x)
+
+            # Check if layer is UnionLayer and requires temperature
+            if isinstance(layer, UnionLayer) and hasattr(layer, 'requires_temperature') and layer.requires_temperature:
+                x = layer(x, temperature=current_logic_temp)
+            else:
+                x = layer(x)
+
             if layer.conn.is_skip_to_layer:
                 layer.x_res = x
         return x
@@ -97,13 +122,17 @@ class MyDistributedDataParallel(torch.nn.parallel.DistributedDataParallel):
 class RRL:
     def __init__(self, dim_list, device_id, use_not=False, is_rank0=False, log_file=None, writer=None, left=None,
                  right=None, save_best=False, estimated_grad=False, save_path=None, distributed=True, use_skip=False,
-                 use_nlaf=False, alpha=0.999, beta=8, gamma=1, temperature=0.01, task='classification', use_log_target=False):
+                 use_nlaf=False, alpha=0.999, beta=8, gamma=1, temperature=0.01, task='classification', use_log_target=False,
+                 logic_temperature=None, init_cl=None, use_linear=False, use_logsumexp=False):
         super(RRL, self).__init__()
         self.dim_list = dim_list
         self.use_not = use_not
         self.use_skip = use_skip
         self.use_nlaf = use_nlaf
-        self.alpha =alpha
+        self.use_linear = use_linear
+        self.use_logsumexp = use_logsumexp
+        self.logic_temperature = logic_temperature  # Temperature for logic layers
+        self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
         self.task = task  # 'classification' or 'regression'
@@ -130,7 +159,7 @@ class RRL:
 
         # Only pass temperature parameter for classification tasks
         net_temperature = temperature if self.task == 'classification' else None
-        self.net = Net(dim_list, use_not=use_not, left=left, right=right, use_nlaf=use_nlaf, estimated_grad=estimated_grad, use_skip=use_skip, alpha=alpha, beta=beta, gamma=gamma, temperature=net_temperature)
+        self.net = Net(dim_list, use_not=use_not, left=left, right=right, use_nlaf=use_nlaf, estimated_grad=estimated_grad, use_skip=use_skip, alpha=alpha, beta=beta, gamma=gamma, temperature=net_temperature, logic_temperature=logic_temperature, init_cl=init_cl, use_linear=use_linear, use_logsumexp=use_logsumexp)
         self.net.cuda(self.device_id)
         if distributed:
             self.net = MyDistributedDataParallel(self.net, device_ids=[self.device_id])
@@ -379,7 +408,8 @@ class RRL:
     def save_model(self):
         rrl_args = {'dim_list': self.dim_list, 'use_not': self.use_not, 'use_skip': self.use_skip, 'estimated_grad': self.estimated_grad,
                     'use_nlaf': self.use_nlaf, 'alpha': self.alpha, 'beta': self.beta, 'gamma': self.gamma, 'task': self.task,
-                    'use_log_target': self.use_log_target}
+                    'use_log_target': self.use_log_target, 'logic_temperature': self.logic_temperature,
+                    'use_linear': self.use_linear, 'use_logsumexp': self.use_logsumexp}
         torch.save({'model_state_dict': self.net.state_dict(), 'rrl_args': rrl_args}, self.save_path)
 
     def detect_dead_node(self, data_loader=None):

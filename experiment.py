@@ -22,7 +22,18 @@ from rrl.models import RRL
 DATA_DIR = './dataset'
 
 
-def get_data_loader(dataset, world_size, rank, batch_size, k=0, pin_memory=False, save_best=True, task='classification'):
+def get_data_loader(dataset, world_size, rank, batch_size, k=0, pin_memory=False, save_best=True, task='classification',
+                    use_quantile_init=False, n_thresholds=10):
+    """
+    Load data and create data loaders.
+
+    Args:
+        use_quantile_init: If True, compute quantiles for continuous features
+        n_thresholds: Number of thresholds for binarization (used for quantile computation)
+
+    Returns:
+        db_enc, train_loader, valid_loader, test_loader, quantiles (None if not using quantile init)
+    """
     data_path = os.path.join(DATA_DIR, dataset + '.data')
     info_path = os.path.join(DATA_DIR, dataset + '.info')
     X_df, y_df, f_df, label_pos = read_csv(data_path, info_path, shuffle=True)
@@ -42,6 +53,22 @@ def get_data_loader(dataset, world_size, rank, batch_size, k=0, pin_memory=False
     X_test = X[test_index]
     y_test = y[test_index]
 
+    # Compute quantiles for continuous features if requested
+    quantiles = None
+    if use_quantile_init and db_enc.continuous_flen > 0:
+        # X_train shape: (n_samples, n_discrete + n_continuous)
+        # We need quantiles for continuous features only
+        X_train_continuous = X_train[:, db_enc.discrete_flen:]
+
+        # Compute quantiles: shape (n_thresholds, n_continuous_features)
+        quantile_positions = np.linspace(0, 1, n_thresholds + 2)[1:-1]  # Exclude 0 and 1
+        # np.percentile returns (n_thresholds, n_features) when axis=0, no need to transpose
+        quantiles = np.percentile(X_train_continuous, quantile_positions * 100, axis=0)
+
+        if rank == 0:
+            logging.info(f"Computed quantiles for {db_enc.continuous_flen} continuous features")
+            logging.info(f"Quantiles shape: {quantiles.shape}")
+
     train_set = TensorDataset(torch.tensor(X_train.astype(np.float32)), torch.tensor(y_train.astype(np.float32)))
     test_set = TensorDataset(torch.tensor(X_test.astype(np.float32)), torch.tensor(y_test.astype(np.float32)))
 
@@ -57,7 +84,7 @@ def get_data_loader(dataset, world_size, rank, batch_size, k=0, pin_memory=False
     valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False, pin_memory=pin_memory)
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, pin_memory=pin_memory)
 
-    return db_enc, train_loader, valid_loader, test_loader
+    return db_enc, train_loader, valid_loader, test_loader, quantiles
 
 
 def train_model(gpu, args):
@@ -75,8 +102,15 @@ def train_model(gpu, args):
         is_rank0 = False
 
     dataset = args.data_set
-    db_enc, train_loader, valid_loader, _ = get_data_loader(dataset, args.world_size, rank, args.batch_size,
-                                                            k=args.ith_kfold, pin_memory=True, save_best=args.save_best, task=args.task)
+
+    # Extract number of thresholds from structure (e.g., "10@128" -> 10)
+    n_thresholds = int(args.structure.split('@')[0])
+
+    # Get data loaders and quantiles (if using quantile initialization)
+    db_enc, train_loader, valid_loader, _, quantiles = get_data_loader(
+        dataset, args.world_size, rank, args.batch_size,
+        k=args.ith_kfold, pin_memory=True, save_best=args.save_best, task=args.task,
+        use_quantile_init=args.use_quantile_init, n_thresholds=n_thresholds)
 
     X_fname = db_enc.X_fname
     y_fname = db_enc.y_fname
@@ -102,7 +136,11 @@ def train_model(gpu, args):
               gamma=args.gamma,
               temperature=args.temp,
               task=args.task,
-              use_log_target=args.use_log_target)
+              use_log_target=args.use_log_target,
+              logic_temperature=args.logic_temp,
+              init_cl=quantiles,
+              use_linear=args.use_linear,
+              use_logsumexp=args.use_logsumexp)
 
     rrl.train_model(
         data_loader=train_loader,
@@ -119,8 +157,10 @@ def train_model(gpu, args):
 
 
 def load_model(path, device_id, log_file=None, distributed=True):
+
     checkpoint = torch.load(path, map_location='cpu')
     saved_args = checkpoint['rrl_args']
+
     rrl = RRL(
         dim_list=saved_args['dim_list'],
         device_id=device_id,
@@ -135,19 +175,42 @@ def load_model(path, device_id, log_file=None, distributed=True):
         beta=saved_args['beta'],
         gamma=saved_args['gamma'],
         task=saved_args.get('task', 'classification'),  # Default to classification for backward compatibility
-        use_log_target=saved_args.get('use_log_target', False))  # Default to False for backward compatibility
+        use_log_target=saved_args.get('use_log_target', False),  # Default to False for backward compatibility
+        logic_temperature=saved_args.get('logic_temperature', None),  # New parameter
+        use_linear=saved_args.get('use_linear', False),  # New parameter
+        use_logsumexp=saved_args.get('use_logsumexp', False))  # New parameter
     stat_dict = checkpoint['model_state_dict']
-    for key in list(stat_dict.keys()):
-        # remove 'module.' prefix
-        stat_dict[key[7:]] = stat_dict.pop(key)
-    rrl.net.load_state_dict(checkpoint['model_state_dict'])
+
+    # Remove 'module.' prefix from keys
+    cleaned_dict = {}
+    for key in stat_dict.keys():
+        new_key = key[7:] if key.startswith('module.') else key
+        cleaned_dict[new_key] = stat_dict[key]
+
+    # Load state dict with strict=False to allow missing/extra keys
+    # This provides backward compatibility with older model versions
+    missing_keys, unexpected_keys = rrl.net.load_state_dict(cleaned_dict, strict=False)
+
+    if missing_keys:
+        print(f"Warning: Missing keys in state_dict: {missing_keys}")
+    if unexpected_keys:
+        print(f"Warning: Unexpected keys in state_dict: {unexpected_keys}")
+
     return rrl
 
 
 def test_model(args):
     rrl = load_model(args.model, args.device_ids[0], log_file=args.test_res, distributed=False)
     dataset = args.data_set
-    db_enc, train_loader, _, test_loader = get_data_loader(dataset, 4, 0, args.batch_size, args.ith_kfold, save_best=False, task=args.task)
+
+    # Extract number of thresholds from structure
+    n_thresholds = int(args.structure.split('@')[0])
+
+    # Get data loaders (quantiles not needed for testing, but API requires it)
+    db_enc, train_loader, _, test_loader, _ = get_data_loader(
+        dataset, 4, 0, args.batch_size, args.ith_kfold, save_best=False, task=args.task,
+        use_quantile_init=False, n_thresholds=n_thresholds)
+
     rrl.test(test_loader=test_loader, set_name='Test')
     if args.print_rule:
         with open(args.rrl_file, 'w') as rrl_file:
